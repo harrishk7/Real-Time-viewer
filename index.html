@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>CubeSat Tracker </title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- Cesium -->
+  <link href="https://unpkg.com/cesium/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <script src="https://unpkg.com/cesium/Build/Cesium/Cesium.js"></script>
+
+  <!-- SGP4 (TLE) -->
+  <script src="https://unpkg.com/satellite.js/dist/satellite.min.js"></script>
+
+  <!-- MQTT (WebSocket) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <style>
+    html, body, #cesiumContainer { width:100%; height:100%; margin:0; padding:0; overflow:hidden; background:#000; }
+
+    #hud {
+      position:absolute; left:12px; top:12px; z-index:10;
+      width: 360px; max-height: calc(100vh - 24px); overflow:auto;
+      padding:12px; border-radius:14px;
+      background: rgba(0,0,0,0.55);
+      border:1px solid rgba(255,255,255,0.14);
+      color:#fff; font:12px/1.45 system-ui, sans-serif;
+      backdrop-filter: blur(8px);
+    }
+    #hud h3 { margin:0 0 10px; font-size:13px; }
+
+    .row { display:flex; gap:8px; margin-bottom:10px; }
+    button {
+      flex:1; cursor:pointer;
+      padding:8px 10px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.06);
+      color:#fff; font:12px system-ui, sans-serif;
+    }
+    button.active {
+      border-color: rgba(0,255,255,0.6);
+      box-shadow: 0 0 0 1px rgba(0,255,255,0.25) inset;
+    }
+    .kv { display:flex; justify-content:space-between; gap:12px; margin:4px 0; }
+    .k { opacity:0.78; }
+    .v { font-variant-numeric: tabular-nums; }
+
+    pre {
+      margin:10px 0 0; padding:8px 10px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 11px; line-height: 1.35;
+    }
+
+    /* Optional: hide Cesium bottom credit bar */
+    .cesium-viewer-bottom { display:none !important; }
+  </style>
+</head>
+
+<body>
+  <div id="cesiumContainer"></div>
+
+  <div id="hud">
+    <h3>CubeSat Tracker</h3>
+
+    <div class="row">
+      <button id="btnSat" class="active">Sat POV</button>
+      <button id="btnWorld">World POV</button>
+      <button id="btn2d">2D POV</button>
+    </div>
+
+    <div class="kv"><div class="k">Status</div><div class="v" id="st">Booting…</div></div>
+    <div class="kv"><div class="k">UTC</div><div class="v" id="utc">—</div></div>
+
+    <div style="height:8px"></div>
+    <div class="kv"><div class="k">Lat</div><div class="v" id="lat">—</div></div>
+    <div class="kv"><div class="k">Lon</div><div class="v" id="lon">—</div></div>
+    <div class="kv"><div class="k">Alt</div><div class="v" id="alt">—</div></div>
+    <div class="kv"><div class="k">Speed</div><div class="v" id="spd">—</div></div>
+
+    <div style="height:8px"></div>
+    <div class="kv"><div class="k">MQTT</div><div class="v" id="mq">—</div></div>
+    <div class="kv"><div class="k">TLE Age</div><div class="v" id="tleAge">—</div></div>
+
+    <pre id="tleBox">Waiting for TLE…</pre>
+  </div>
+
+<script>
+(async function () {
+  // ------------ CONFIG ------------
+  const MODEL_URI = "./assets/CubeSat.glb";
+
+  // MQTT (browser needs WebSocket MQTT)
+  const MQTT_URL  = "wss://broker.hivemq.com:8884/mqtt";
+  const TOPIC_TLE = "cubesat/tle";
+  // payload:
+  // JSON: {"name":"NORBY","line1":"...","line2":"..."}
+  // OR text:
+  // NORBY
+  // 1 ....
+  // 2 ....
+
+  // Trails (past/future)
+  const TRAIL_PAST_SEC   = 45 * 60;
+  const TRAIL_FUTURE_SEC = 45 * 60;
+  const TRAIL_STEP_SEC   = 10;
+
+  // Smooth motion (SampledPositionProperty)
+  const SAMPLE_PAST_SEC   = 10 * 60;
+  const SAMPLE_FUTURE_SEC = 10 * 60;
+  const SAMPLE_STEP_SEC   = 2;     // smaller = smoother (more CPU)
+
+  // Coverage circle
+  const MIN_ELEV_DEG = 10;
+  const COVER_ALPHA  = 0.22;
+
+  // India home view (Home button)
+  const INDIA_HOME = { lon: 78.9629, lat: 20.5937, height: 8.0e6 };
+
+  // World POV altitude (whole globe)
+  const WORLD_ALT = 3.2e7;
+
+  // ------------ DOM ------------
+  const el = (id) => document.getElementById(id);
+  const stEl = el("st"), utcEl = el("utc"), latEl = el("lat"), lonEl = el("lon"),
+        altEl = el("alt"), spdEl = el("spd"), mqEl = el("mq"),
+        tleAgeEl = el("tleAge"), tleBox = el("tleBox");
+
+  const btnSat = el("btnSat"), btnWorld = el("btnWorld"), btn2d = el("btn2d");
+  function setActive(btn){
+    [btnSat, btnWorld, btn2d].forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+  }
+  function setStatus(s){ stEl.textContent = s; }
+  function nowUTCString(){ return new Date().toISOString().replace("T"," ").replace("Z"," UTC"); }
+
+  // ------------ Cesium Viewer (clean UI) ------------
+  const viewer = new Cesium.Viewer("cesiumContainer", {
+    animation: false,
+    timeline: false,
+    baseLayerPicker: false,
+    sceneModePicker: false,
+    geocoder: false,
+    navigationHelpButton: false,
+    fullscreenButton: false,
+    infoBox: false,
+    selectionIndicator: false,
+    homeButton: true
+  });
+
+  viewer.scene.globe.enableLighting = true;
+
+  // Start at India
+  viewer.camera.setView({ destination: Cesium.Cartesian3.fromDegrees(INDIA_HOME.lon, INDIA_HOME.lat, INDIA_HOME.height) });
+
+  // Home -> India (override default)
+  viewer.homeButton.viewModel.command.beforeExecute.addEventListener((e) => {
+    e.cancel = true;
+    viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(INDIA_HOME.lon, INDIA_HOME.lat, INDIA_HOME.height),
+      duration: 1.1
+    });
+  });
+
+  // Real-time clock
+  viewer.clock.clockRange = Cesium.ClockRange.UNBOUNDED;
+  viewer.clock.multiplier = 1;
+
+  // ------------ SGP4/TLE State ------------
+  let satName = "CubeSat";
+  let tleLine1 = null, tleLine2 = null;
+  let satrec = null;
+  let tleReceivedAt = null;
+
+  function parseTLEMessage(msg) {
+    try {
+      const j = JSON.parse(msg);
+      if (j && j.line1 && j.line2) return { name: j.name || "SAT", l1: j.line1.trim(), l2: j.line2.trim() };
+    } catch {}
+    const lines = msg.split("\n").map(s=>s.trim()).filter(Boolean);
+    if (lines.length >= 3) return { name: lines[0], l1: lines[1], l2: lines[2] };
+    if (lines.length >= 2) return { name: "SAT", l1: lines[0], l2: lines[1] };
+    return null;
+  }
+
+  function propagateLLA(date) {
+    if (!satrec) return null;
+
+    const pv = satellite.propagate(satrec, date);
+    if (!pv || !pv.position || !pv.velocity) return null;
+
+    const gmst = satellite.gstime(date);
+    const gd = satellite.eciToGeodetic(pv.position, gmst);
+
+    const lat = Cesium.Math.toDegrees(gd.latitude);
+    const lon = Cesium.Math.toDegrees(gd.longitude);
+    const altKm = gd.height;
+
+    const v = pv.velocity;
+    const speedKmS = Math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+
+    return { lat, lon, altKm, speedKmS };
+  }
+
+  function llaToCartesian(lat, lon, altKm){
+    return Cesium.Cartesian3.fromDegrees(lon, lat, altKm * 1000);
+  }
+
+  // Coverage radius on ground from altitude and min elevation
+  function coverageRadiusMeters(altMeters, minElevDeg) {
+    const R = 6378137.0;
+    const h = Math.max(0, altMeters);
+    const e = Cesium.Math.toRadians(minElevDeg);
+    const term = (R / (R + h)) * Math.cos(e);
+    const psi = Math.acos(Math.min(1, Math.max(-1, term))) - e;
+    return Math.max(0, R * psi);
+  }
+
+  // ------------ Smooth position property ------------
+  let sampledPos = new Cesium.SampledPositionProperty();
+  function newSampledProperty() {
+    const p = new Cesium.SampledPositionProperty();
+    p.setInterpolationOptions({
+      interpolationDegree: 5,
+      interpolationAlgorithm: Cesium.LagrangePolynomialApproximation
+    });
+    return p;
+  }
+  sampledPos = newSampledProperty();
+
+  // rebuild samples around "now" so motion stays smooth
+  function rebuildSampledPosition(centerDate) {
+    if (!satrec) return;
+
+    const p = newSampledProperty();
+    const centerTime = Cesium.JulianDate.fromDate(centerDate);
+
+    for (let t = -SAMPLE_PAST_SEC; t <= SAMPLE_FUTURE_SEC; t += SAMPLE_STEP_SEC) {
+      const d = new Date(centerDate.getTime() + t*1000);
+      const s = propagateLLA(d);
+      if (!s) continue;
+      const time = Cesium.JulianDate.addSeconds(centerTime, t, new Cesium.JulianDate());
+      p.addSample(time, llaToCartesian(s.lat, s.lon, s.altKm));
+    }
+
+    sampledPos = p;
+    satEntity.position = sampledPos;
+    satEntity.orientation = new Cesium.VelocityOrientationProperty(sampledPos);
+  }
+
+  // ------------ Entities ------------
+  const satEntity = viewer.entities.add({
+    name: "CubeSat",
+    position: sampledPos,
+    orientation: new Cesium.VelocityOrientationProperty(sampledPos),
+    model: {
+      uri: MODEL_URI,
+      scale: 1.0,
+      minimumPixelSize: 48,
+      maximumScale: 20000
+    },
+    label: {
+      text: new Cesium.CallbackProperty(() => satName, false),
+      font: "14px system-ui",
+      fillColor: Cesium.Color.WHITE,
+      outlineColor: Cesium.Color.BLACK,
+      outlineWidth: 3,
+      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+      pixelOffset: new Cesium.Cartesian2(12, -12),
+      distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 2.0e7)
+    }
+  });
+
+  const trailEntity = viewer.entities.add({
+    polyline: {
+      positions: [],
+      width: 2.2,
+      material: new Cesium.PolylineGlowMaterialProperty({
+        glowPower: 0.18,
+        color: Cesium.Color.CYAN.withAlpha(0.85)
+      })
+    }
+  });
+
+  // ------------ Coverage (NO FLICKER) using CallbackProperty + smoothing ------------
+  let covLon = 0, covLat = 0;
+  let covRadiusM = 0;
+  let covRadiusSmoothM = 0;
+  const COV_SMOOTH = 0.15;
+
+  const coverageEntity = viewer.entities.add({
+    position: new Cesium.CallbackProperty(() => {
+      return Cesium.Cartesian3.fromDegrees(covLon, covLat, 0);
+    }, false),
+    ellipse: {
+      semiMajorAxis: new Cesium.CallbackProperty(() => covRadiusSmoothM, false),
+      semiMinorAxis: new Cesium.CallbackProperty(() => covRadiusSmoothM, false),
+      material: Cesium.Color.YELLOW.withAlpha(COVER_ALPHA),
+      outline: true,
+      outlineColor: Cesium.Color.YELLOW.withAlpha(0.75),
+      height: 0,
+      heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+    }
+  });
+
+  // ------------ Trail update ------------
+  function updateTrail(centerDate) {
+    if (!satrec) return;
+    const pts = [];
+    for (let dt = -TRAIL_PAST_SEC; dt <= TRAIL_FUTURE_SEC; dt += TRAIL_STEP_SEC) {
+      const d = new Date(centerDate.getTime() + dt*1000);
+      const s = propagateLLA(d);
+      if (!s) continue;
+      pts.push(llaToCartesian(s.lat, s.lon, s.altKm));
+    }
+    trailEntity.polyline.positions = pts;
+  }
+
+  // ------------ HUD + coverage update ------------
+  function updateHUDAndCoverage() {
+    utcEl.textContent = nowUTCString();
+
+    if (!satrec) {
+      latEl.textContent = lonEl.textContent = altEl.textContent = spdEl.textContent = "—";
+      tleAgeEl.textContent = "—";
+      return;
+    }
+
+    const d = new Date();
+    const s = propagateLLA(d);
+    if (!s) return;
+
+    latEl.textContent = s.lat.toFixed(5) + "°";
+    lonEl.textContent = s.lon.toFixed(5) + "°";
+    altEl.textContent = s.altKm.toFixed(1) + " km";
+    spdEl.textContent = s.speedKmS.toFixed(3) + " km/s";
+
+    if (tleReceivedAt) {
+      const ageSec = Math.floor((Date.now() - tleReceivedAt.getTime())/1000);
+      tleAgeEl.textContent = ageSec + " s";
+    }
+
+    // coverage (smooth, no flicker)
+    covLon = s.lon;
+    covLat = s.lat;
+    covRadiusM = coverageRadiusMeters(s.altKm * 1000, MIN_ELEV_DEG);
+    covRadiusSmoothM = covRadiusSmoothM
+      ? (covRadiusSmoothM + COV_SMOOTH * (covRadiusM - covRadiusSmoothM))
+      : covRadiusM;
+  }
+
+  // HUD fast, sample/trail slower
+  setInterval(updateHUDAndCoverage, 200);     // 5 Hz
+  setInterval(() => {
+    if (!satrec) return;
+    const d = new Date();
+    rebuildSampledPosition(d);
+    updateTrail(d);
+  }, 6000); // smoother + less CPU than 3s
+
+  // ------------ POV Modes ------------
+  function setSatPOV() {
+    setActive(btnSat);
+    viewer.scene.morphTo3D(0.6);
+    viewer.trackedEntity = satEntity;
+    setStatus("Sat POV ✅");
+  }
+
+  function setWorldPOV() {
+    setActive(btnWorld);
+    viewer.scene.morphTo3D(0.6);
+    viewer.trackedEntity = undefined;
+
+    // Whole globe view + try to point toward current sub-sat point
+    const d = new Date();
+    const s = propagateLLA(d);
+
+    const destination = Cesium.Cartesian3.fromDegrees(0, 20, WORLD_ALT);
+    const focus = s ? Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 0) : Cesium.Cartesian3.ZERO;
+
+    const dir = Cesium.Cartesian3.normalize(
+      Cesium.Cartesian3.subtract(focus, destination, new Cesium.Cartesian3()),
+      new Cesium.Cartesian3()
+    );
+
+    viewer.camera.flyTo({
+      destination,
+      orientation: { direction: dir, up: Cesium.Cartesian3.UNIT_Z },
+      duration: 1.2
+    });
+
+    setStatus("World POV ✅");
+  }
+
+  function set2DPOV() {
+    setActive(btn2d);
+    viewer.scene.morphTo2D(0.8);
+    viewer.trackedEntity = satEntity;
+    setStatus("2D POV ✅");
+  }
+
+  btnSat.onclick = setSatPOV;
+  btnWorld.onclick = setWorldPOV;
+  btn2d.onclick = set2DPOV;
+
+  // Default POV
+  setSatPOV();
+
+  // ------------ Apply TLE ------------
+  function setTLE(name, l1, l2) {
+    satName = name || "SAT";
+    tleLine1 = l1; tleLine2 = l2;
+    tleReceivedAt = new Date();
+    satrec = satellite.twoline2satrec(tleLine1, tleLine2);
+
+    tleBox.textContent = `${satName}\n${tleLine1}\n${tleLine2}`;
+    setStatus("TLE loaded ✅");
+
+    const d = new Date();
+    rebuildSampledPosition(d);
+    updateTrail(d);
+  }
+
+  // ------------ MQTT (TLE live) ------------
+setStatus("Connecting MQTT…");
+mqEl.textContent = "Connecting…";
+
+// Try WSS first, fallback to WS (some networks block 8884)
+const MQTT_URLS = [
+  "ws://broker.mqttdashboard.com:8000/mqtt",
+  "wss://broker.mqttdashboard.com:8884/mqtt"
+];
+
+let mqttClient = null;
+let mqttIndex = 0;
+
+function connectMqtt() {
+  const url = MQTT_URLS[mqttIndex];
+  console.log("MQTT trying:", url);
+  setStatus("MQTT trying: " + url);
+  mqEl.textContent = "Trying…";
+
+  mqttClient = mqtt.connect(url, {
+    keepalive: 30,
+    reconnectPeriod: 2000,
+    connectTimeout: 8000
+  });
+
+  mqttClient.on("connect", () => {
+    console.log("MQTT CONNECT ✅", url);
+    mqEl.textContent = "Connected ✅";
+    setStatus("MQTT connected ✅");
+    mqttClient.subscribe(TOPIC_TLE, (err) => {
+      console.log("SUBSCRIBE", TOPIC_TLE, err || "OK");
+      setStatus(err ? ("Subscribe error ❌ " + err) : ("Subscribed ✅ " + TOPIC_TLE));
+    });
+  });
+
+  mqttClient.on("message", (topic, payload) => {
+    const msg = payload.toString();
+    console.log("MQTT RX:", topic, msg);
+    setStatus("MQTT message received ✅");
+
+    // Show raw message (super useful to debug)
+    tleBox.textContent = "RAW MQTT:\n" + msg;
+
+    if (topic !== TOPIC_TLE) return;
+    const tle = parseTLEMessage(msg);
+    if (!tle) { setStatus("Bad TLE format ❌"); return; }
+
+    setTLE(tle.name, tle.l1, tle.l2);
+
+    // Keep whatever POV is active
+    if (btnWorld.classList.contains("active")) setWorldPOV();
+    else if (btn2d.classList.contains("active")) set2DPOV();
+    else setSatPOV();
+  });
+
+  mqttClient.on("reconnect", () => {
+    console.log("MQTT reconnecting…");
+    mqEl.textContent = "Reconnecting…";
+    setStatus("MQTT reconnecting…");
+  });
+
+  mqttClient.on("close", () => {
+    console.log("MQTT close");
+    mqEl.textContent = "Disconnected";
+    setStatus("MQTT disconnected");
+
+    // If never connected, try fallback URL once
+    if (mqttIndex < MQTT_URLS.length - 1) {
+      mqttIndex++;
+      try { mqttClient.end(true); } catch {}
+      connectMqtt();
+    }
+  });
+
+  mqttClient.on("error", (e) => {
+    console.log("MQTT error", e);
+    mqEl.textContent = "Error";
+    setStatus("MQTT error ❌ (check console)");
+  });
+}
+
+connectMqtt();
+
+
+
+
+})();
+</script>
+</body>
+</html>
